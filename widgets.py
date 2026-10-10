@@ -26,15 +26,18 @@ import vlc
 from pygame import mixer
 
 from import_system import append_folder_to_songs_path, get_playlists
+from search_helper import search_help
 import songs_path
 
 IS_WIN = os.name == "nt"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CLICK_SOUND_PATH = os.path.join(BASE_DIR, "turning_pages-ui-toggle-off-confirmation-608627.mp3")
-
 BOX_INNER_WIDTH = 60
-
+DIM = "\033[2m"
+REV = "\033[7m"
+RESET = "\033[0m"
+LIST_BOX_WIDTH = 80
 
 def _enable_vt():
     # ponytail: Win10+ only, turns on ANSI handling; no-op elsewhere
@@ -95,11 +98,49 @@ class UiWidgets:
             if msvcrt is None or not msvcrt.kbhit():
                 return None
             ch = msvcrt.getwch()
-            if ch in ('\x00', '\xe0'):
-                if not msvcrt.kbhit():
-                    return None
+            if ch == '\x1b':
+                for _ in range(15):
+                    if msvcrt.kbhit():
+                        break
+                    time.sleep(0.002)
+                if msvcrt.kbhit():
+                    ch2 = msvcrt.getwch()
+                    if ch2 == '[':
+                        for _ in range(15):
+                            if msvcrt.kbhit():
+                                break
+                            time.sleep(0.002)
+                        if msvcrt.kbhit():
+                            ch3 = msvcrt.getwch()
+                            arrow = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT",
+                                     "a": "UP", "b": "DOWN", "c": "RIGHT", "d": "LEFT"}.get(ch3)
+                            if arrow:
+                                return arrow
+                        return None
+
+                    if ch2 in ("O", "o"):
+                        for _ in range(15):
+                            if msvcrt.kbhit():
+                                break
+                            time.sleep(0.002)
+                        if msvcrt.kbhit():
+                            ch3 = msvcrt.getwch()
+                            arrow = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT",
+                                     "a": "UP", "b": "DOWN", "c": "RIGHT", "d": "LEFT"}.get(ch3)
+                            if arrow:
+                                return arrow
+                        return None
+                    arrow = {"A": "UP", "B": "DOWN", "C": "RIGHT", "D": "LEFT"}.get(ch2)
+                    if arrow:
+                        return arrow
+                return "ESC"
+            if ch in ("\x00", "\xe0"):
                 ch2 = msvcrt.getwch()
-                return {'M': 'RIGHT', 'K': 'LEFT', 'H': 'UP', 'P': 'DOWN'}.get(ch2)
+                got = {'M': 'RIGHT', 'K': 'LEFT', 'H': 'UP', 'P': 'DOWN',
+                       'm': 'RIGHT', 'k': 'LEFT', 'h': 'UP', 'p': 'DOWN'}.get(ch2)
+                if got:
+                    return got
+                return None
             return ch.lower() if ch else None
 
         fd = sys.stdin.fileno()
@@ -107,11 +148,25 @@ class UiWidgets:
             return None
 
         key = os.read(fd, 1).decode(errors="ignore")
-        if key == '\x1b':
-            if select.select([fd], [], [], 0.02)[0]:
-                seq = os.read(fd, 2).decode(errors="ignore")
-                return {'[C': 'RIGHT', '[D': 'LEFT', 'OC': 'RIGHT', 'OD': 'LEFT',
-                        '[A': 'UP', '[B': 'DOWN', 'OA': 'UP', 'OB': 'DOWN'}.get(seq)
+        if key == "\x1b":
+            seq = ""
+            for _ in range(15):
+                if select.select([fd], [], [], 0.002)[0]:
+                    seq += os.read(fd, 1).decode(errors="ignore")
+                    if len(seq) >= 2:
+                        break
+
+                    elif seq:
+                        break
+            if not seq:
+                return "ESC"
+                    
+            got = {'[C': 'RIGHT', '[D': 'LEFT', 'OC': 'RIGHT', 'OD': 'LEFT',
+                    '[A': 'UP', '[B': 'DOWN', 'OA': 'UP', 'OB': 'DOWN',
+                    '[c': 'RIGHT', '[d': 'LEFT', 'oc': 'RIGHT', 'od': 'LEFT',
+                    '[a': 'UP', '[b': 'DOWN', 'oa': 'UP', 'ob': 'DOWN'}.get(seq)
+            if got:
+                return got
             return None
         return key.lower() if key else None
 
@@ -408,63 +463,209 @@ class UiWidgets:
         start = 0
         end = 10
         select_index = 0
-        temp_select_list = [_song_name(song) for song in playlist]
+        temp_select_list = [_song_name(s) for s in playlist]
+        all_songs = list(enumerate(temp_select_list))
+        query = ""
+        searching = False
+        filtered = all_songs
+        select_index = 0
+        start = 0
+        end = min(10, len(filtered))
         needs_redraw = True
+        caret_on = True
+        last_blink = time.monotonic()
+
+        def refilter():
+            nonlocal filtered, select_index, start, end, needs_redraw, caret_on, last_blink
+            filtered = search_help(query, all_songs)
+            caret_on = True
+            last_blink = time.monotonic()
+            select_index = 0
+            start = 0
+            end = min(10, len(filtered))
+            needs_redraw = True
 
         while True:
-            total = len(temp_select_list)
+            total = len(filtered)
             start = max(0, min(start, max(0, total - 10)))
             end = min(start + 10, total)
 
+            if searching and time.monotonic() - last_blink >= 0.5:
+                caret_on = not caret_on
+                last_blink = time.monotonic()
+                needs_redraw = True
+
             if needs_redraw:
                 out = "\033[H"
-                for line_index in range(start, end):
-                    song_name = temp_select_list[line_index]
-                    if line_index == select_index:
-                        out += f"\033[2K\r> {song_name} <\n"
+                border = "+" + "-" * LIST_BOX_WIDTH + "+"
+                out += f"\033[2K\r{border}\n"
+                if searching:
+                    caret = "▌" if caret_on else " "
+                    left = f" {query[-66:]}{caret}"
+                    right = f"{total}/{len(all_songs)}"
+                    max_left = LIST_BOX_WIDTH - len(right) - 1
+
+                    if len(left) > max_left:
+                        left = left[-max_left:]
+                    gap = LIST_BOX_WIDTH - len(left) - len(right)
+                    out += f"\033[2K\r {left}{" " * max(gap, 1)}{DIM}{right}{RESET} \n"
+
+                else:
+                    out += f"\033[2K\r {" Search: [press /]".ljust(LIST_BOX_WIDTH)[:LIST_BOX_WIDTH]} \n"
+
+                if total == 0:
+                    inner = f" No match found!".ljust(LIST_BOX_WIDTH)[:LIST_BOX_WIDTH]
+                    out += f"\033[2K\r {inner} \n"
+
+                for pos in range(start, end):
+                    _i, name = filtered[pos]
+                    inner = f"{pos + 1:>2}. {truncate(name, 68)}".ljust(LIST_BOX_WIDTH)[:LIST_BOX_WIDTH]
+
+                    if pos == select_index:
+                        out += f"\033[2K\r {REV}{inner}{RESET} \n"
+
                     else:
-                        out += f"\033[2K\r  {song_name}  \n"
-                out += "\033[2K\r   [Up/N] Up | [Down/M] Down | [Enter] Play | [Q] Back\n"
+                        out += f"\033[2K\r {inner} \n"
+                marks = ("▲" if start > 0 else "") + ("▼" if end < total else "")
+                if searching:
+                    ctl = "[Type] filter | [⌫] del | [Up/Down] move | [↩] select | [ESC] exit"
+                else:
+                    ctl = "[/] Search | [Up/N] Up | [Down/M] Down | [↩] Play | [Q] Back"
+                if marks:
+                    ctl = f"{ctl} {marks}"
+                inner = (" " + truncate(ctl, LIST_BOX_WIDTH - 1)).ljust(LIST_BOX_WIDTH)[:LIST_BOX_WIDTH]
+                out += f"\033[2K\r {DIM}{inner}{RESET} \n"
+                out += f"\033[2K\r{border}\n"
                 out += "\033[J"
                 sys.stdout.write(out)
                 sys.stdout.flush()
                 needs_redraw = False
 
-            key = self.check_key_presses()
+            keys = []
+            for _ in range(5):
+                k = self.check_key_presses()
+                if k is None:
+                    break
+                keys.append(k)
 
-            if key == 'q':
+            if not keys:
+                time.sleep(0.01)
+                continue
+
+            quit_list = False
+            for key in keys:
+                total = len(filtered)
+                if searching:
+
+                    if key == "ESC":
+                        self.click_sound.play()
+                        searching = False
+                        query = ""
+                        filtered = all_songs
+                        select_index, start = 0, 0
+                        end = min(10, len(filtered))
+                        needs_redraw = True
+                        continue
+
+                    if len(key) == 1 and ord(key) in (10, 13):
+                        if filtered and select_index < len(filtered):
+                            orig, name = filtered[select_index]
+                            self._dispose(player)
+                            self.click_sound.play()
+                            new_player, new_song_time = self._start_player(playlist[orig])
+                            self.reset(name)
+                            self.clear_screen()
+                            return new_player, new_song_time, playlist, orig
+                        continue
+
+                    if key in ("\x08", "\x7f"):
+                        self.click_sound.play()
+                        query = query[:-1]
+                        refilter()
+                        total = len(filtered)
+                        continue
+
+                    if key in ("UP", "DOWN"):
+                        total = len(filtered)
+                        if key == "DOWN" and select_index < total - 1:
+                            select_index += 1
+                            if select_index >= end:
+                                start += 1
+                                end += 1
+
+                            needs_redraw = True
+                            last_blink = time.monotonic()
+
+                        elif key == "UP" and select_index > 0:
+                            select_index -= 1
+                            if select_index < start:
+                                start -= 1
+                                end -= 1
+
+                            needs_redraw = True
+                            last_blink = time.monotonic()
+                        continue
+
+                    if len(key) == 1 and 32 <= ord(key) <= 126:
+                        self.click_sound.play()
+                        query += key
+                        refilter()
+                        continue
+                    continue
+
+                if key == "q":
+                    quit_list = True
+                    break
+
+                if key == "/":
+                    self.click_sound.play()
+                    searching = True
+                    query = ""
+                    caret_on = True
+                    last_blink = time.monotonic()
+                    filtered = all_songs
+                    select_index, start = 0, 0
+                    end = min(10, len(filtered))
+                    needs_redraw = True
+                    continue
+
+                if key in ("m", "DOWN"):
+                    total = len(filtered)
+                    if select_index < total - 1:
+                        select_index += 1
+                        needs_redraw = True
+
+                        if start < total - 10 and select_index > start:
+                            start += 1
+                            end += 1
+
+                    continue
+
+                if key in ("n", "UP"):
+                    if select_index > 0:
+                        select_index -= 1
+                        needs_redraw = True
+                        if select_index < start:
+                            start -= 1
+                            end -= 1
+                
+                    continue
+
+                if len(key) == 1 and ord(key) in (10, 13):
+                    if filtered and select_index < len(filtered):
+                        orig, name = filtered[select_index]
+                        self._dispose(player)
+                        self.click_sound.play()
+                        new_player, new_song_time = self._start_player(playlist[orig])
+                        self.reset(name)
+                        self.clear_screen()
+
+                        return new_player, new_song_time, playlist, orig
+
+                    continue
+
+            if quit_list:
                 break
-
-            if key in ('m', 'DOWN'):
-                if select_index < len(temp_select_list) - 1:
-                    select_index += 1
-                    needs_redraw = True
-                    if start < len(temp_select_list) - 10 and select_index > start:
-                        start += 1
-                        end += 1
-
-            if key in ('n', 'UP'):
-                if select_index > 0:
-                    select_index -= 1
-                    needs_redraw = True
-                    if select_index < start:
-                        start -= 1
-                        end -= 1
-
-            if key and len(key) == 1 and ord(key) in (10, 13):
-                self._dispose(player)
-                self.click_sound.play()
-
-                selected_song_path = playlist[select_index]
-                new_song_name = temp_select_list[select_index]
-
-                new_player, new_song_time = self._start_player(selected_song_path)
-                self.reset(new_song_name)
-
-                self.clear_screen()
-                return new_player, new_song_time, playlist, select_index
-
-            time.sleep(0.05)
 
         self.clear_screen()
         return player, song_time, playlist, current_index
